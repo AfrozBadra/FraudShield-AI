@@ -1,0 +1,28 @@
+# Local dataset (about 144 MiB; above GitHub's standard 100 MB per-file limit).
+# The dashboard still reads this file locally. Download it from Kaggle instead
+# of committing it. Do not ignore the saved model or application files.
+creditcard.csv
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+
+# Local Streamlit secrets and logs
+.streamlit/secrets.toml
+*.log
