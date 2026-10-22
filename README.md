@@ -10,11 +10,12 @@ model.
 
 - **Overview** — saved-model snapshot, verified held-out test metrics, confusion
   matrix, and plain-language metric definitions.
-- **Risk Analysis** — score a row from the local `creditcard.csv`, or enter all
-  30 model features in the custom-input mode. Dataset labels are shown
-  separately from model predictions.
+- **Risk Analysis** — score a row from the loaded dataset, or enter all 30 model
+  features in the custom-input mode. Dataset labels are shown separately from
+  model predictions.
 - **Dataset Explorer** — row and column counts, class distribution, fraud rate,
-  missing values, duplicate rows, schema, and a small preview.
+  missing values, duplicate rows, schema, and a small preview for whichever
+  dataset is actually loaded.
 - **Model Performance** — fixed held-out test results, error analysis, threshold
   policy, and caveats about the small number of test fraud cases.
 - **Model Details** — artifact contents, evaluation setup, input contract,
@@ -90,7 +91,8 @@ ask users to cite:
 > In Symposium on Computational Intelligence and Data Mining (CIDM), IEEE, 2015.
 
 This project does not claim ownership of the original dataset. The repository
-does not redistribute the CSV.
+does not redistribute the complete CSV. It does include a small, clearly
+labelled preview sample for the deployed demo (see below).
 
 ### License status
 
@@ -120,6 +122,28 @@ Preprocessing performed by the project scripts:
    `random_state=42`.
 5. Train the Random Forest on the training split and select the threshold using
    validation-set F1. The held-out test split is used only for final evaluation.
+
+### Bundled sample preview (not the complete dataset)
+
+The full `creditcard.csv` is intentionally excluded from Git because it is about
+144 MB. To keep the deployed app usable, the repository includes
+`data/sample_transactions.csv`:
+
+- **100 rows** drawn from the real local dataset with `random_state=42`.
+- **80 legitimate** (`Class = 0`) and **20 fraudulent** (`Class = 1`) rows.
+- The same 31 columns as the original: `Time`, `V1`–`V28`, `Amount`, `Class`.
+- Fraud is deliberately over-represented so both classes remain visible in a
+  small preview. The sample fraud rate is therefore **not** the original
+  dataset's fraud rate and must not be used to describe the full data.
+
+The app prefers the complete local `creditcard.csv` whenever it exists. If that
+file is absent (as on Streamlit Community Cloud), the dashboard falls back to
+this sample and labels every affected page as a limited preview. The saved
+model, feature order (`Time`, `V1`–`V28`, `Amount`), threshold (`0.20`), and the
+verified held-out metrics are unchanged. `Class` is never passed to the model.
+
+The sample is for demonstration and smoke testing only. It is not used to train
+the model or recompute the verified test metrics.
 
 ## Installation
 
@@ -170,7 +194,9 @@ dashboard. The app only reads local files.
    dataset automatically.
 
 The CSV is listed in `.gitignore` because it exceeds GitHub's standard 100 MB
-per-file limit. Keep it locally; do not commit it.
+per-file limit. Keep it locally; do not commit it. If it is missing, the app
+automatically uses the committed `data/sample_transactions.csv` preview and
+says so on the Risk Analysis and Dataset Explorer pages.
 
 ## Run the dashboard
 
@@ -219,7 +245,9 @@ FraudShield AI/
 ├── 08_save_model.py             # Artifact creation
 ├── 09_test_saved_model.py       # Saved-artifact smoke check
 ├── 10_app.py                    # Streamlit dashboard
-├── creditcard.csv               # Local dataset (not committed)
+├── creditcard.csv               # Full local dataset (not committed)
+├── data/
+│   └── sample_transactions.csv  # 100-row committed preview (not the full data)
 ├── models/
 │   └── fraudshield_random_forest.joblib
 ├── tests/
@@ -232,10 +260,18 @@ FraudShield AI/
 
 ## Deployment
 
-No public FraudShield AI deployment URL is currently confirmed. The previously
-known `machineguard-aiml.streamlit.app` address belongs to a different
-(MachineGuard) project and is not a FraudShield AI deployment. Run the app
-locally using the instructions above.
+The Streamlit Community Cloud deployment is:
+
+<https://payshield-ml.streamlit.app/>
+
+Streamlit Cloud checks out the GitHub repository without the git-ignored full
+CSV. The deployed app therefore reads `data/sample_transactions.csv` and labels
+the Dataset Explorer and sample-transaction mode as a limited preview. To use
+the complete dataset on a server, upload or mount `creditcard.csv` next to
+`10_app.py`; the app will prefer it automatically. No secrets are required.
+
+The previously known `machineguard-aiml.streamlit.app` address belongs to a
+different (MachineGuard) project and is not a FraudShield AI deployment.
 
 ## Limitations
 
@@ -252,5 +288,8 @@ locally using the instructions above.
   needs human review and appropriate controls.
 - The dashboard uses no live transactions, banking connections, external APIs,
   or telemetry. It reads local files only.
+- When the full CSV is absent, the Dataset Explorer and sample-transaction mode
+  use the 100-row preview. Statistics from that preview describe the sample
+  only and are not full-dataset statistics.
 - Avoid upgrading scikit-learn without re-exporting the joblib artifact, because
   saved model artifacts can be version-sensitive.

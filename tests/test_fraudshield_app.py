@@ -103,7 +103,13 @@ def app_text(at):
     return "\n".join(pieces)
 
 
-def make_temp_app(with_model=True, dataset=None, corrupt_model=False, artifact_threshold=None):
+def make_temp_app(
+    with_model=True,
+    dataset=None,
+    corrupt_model=False,
+    artifact_threshold=None,
+    sample_dataset=None,
+):
     """Copy the app into an isolated temp directory; never touch real files."""
     temp_dir = tempfile.mkdtemp(prefix="fraudshield_apptest_")
     directory = Path(temp_dir)
@@ -121,7 +127,20 @@ def make_temp_app(with_model=True, dataset=None, corrupt_model=False, artifact_t
             app.joblib.dump(modified, model_target)
     if dataset is not None:
         (directory / "creditcard.csv").write_text(dataset)
+    if sample_dataset is not None:
+        sample_dir = directory / "data"
+        sample_dir.mkdir()
+        (sample_dir / "sample_transactions.csv").write_text(sample_dataset)
     return directory
+
+
+def synthetic_dataset_csv(rows=3, fraud_rows=1):
+    """Build a valid 31-column CSV string for isolated fallback tests."""
+    records = []
+    for index in range(rows):
+        label = 1 if index < fraud_rows else 0
+        records.append([index] + [0.01 * index] * 28 + [10.0 + index, label])
+    return pd.DataFrame(records, columns=DATASET_COLUMNS).to_csv(index=False)
 
 
 class TestArtifactAndMetrics(unittest.TestCase):
@@ -509,6 +528,9 @@ class TestSafeLoadingAndCaching(unittest.TestCase):
         self.assertEqual(app.PROJECT_DIR, ROOT)
         self.assertEqual(app.MODEL_PATH, ROOT / "models" / "fraudshield_random_forest.joblib")
         self.assertEqual(app.DATASET_PATH, ROOT / "creditcard.csv")
+        self.assertEqual(
+            app.SAMPLE_DATASET_PATH, ROOT / "data" / "sample_transactions.csv"
+        )
 
     def test_app_source_has_no_training_or_model_writes(self):
         source = APP_PATH.read_text()
@@ -522,6 +544,110 @@ class TestSafeLoadingAndCaching(unittest.TestCase):
             https_urls,
             ["https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud"],
         )
+
+
+class TestDatasetSourceResolution(unittest.TestCase):
+    def test_full_dataset_is_preferred_when_both_files_exist(self):
+        with tempfile.TemporaryDirectory(prefix="fraudshield_source_") as temp_dir:
+            root = Path(temp_dir)
+            full = root / "creditcard.csv"
+            sample = root / "data" / "sample_transactions.csv"
+            sample.parent.mkdir()
+            full.write_text(synthetic_dataset_csv())
+            sample.write_text(synthetic_dataset_csv())
+
+            source = app.resolve_dataset(full, sample)
+            self.assertEqual(source["kind"], "full")
+            self.assertEqual(source["path"], full)
+            self.assertFalse(source["is_sample"])
+            self.assertEqual(source["label"], "creditcard.csv")
+
+    def test_bundled_sample_is_used_when_full_dataset_is_absent(self):
+        with tempfile.TemporaryDirectory(prefix="fraudshield_source_") as temp_dir:
+            root = Path(temp_dir)
+            full = root / "creditcard.csv"
+            sample = root / "data" / "sample_transactions.csv"
+            sample.parent.mkdir()
+            sample.write_text(synthetic_dataset_csv())
+
+            source = app.resolve_dataset(full, sample)
+            self.assertEqual(source["kind"], "sample")
+            self.assertEqual(source["path"], sample)
+            self.assertTrue(source["is_sample"])
+            self.assertEqual(source["label"], "data/sample_transactions.csv")
+
+    def test_missing_source_when_neither_file_exists(self):
+        with tempfile.TemporaryDirectory(prefix="fraudshield_source_") as temp_dir:
+            root = Path(temp_dir)
+            source = app.resolve_dataset(
+                root / "creditcard.csv", root / "data" / "sample_transactions.csv"
+            )
+            self.assertEqual(source["kind"], "missing")
+            self.assertIsNone(source["path"])
+            self.assertFalse(source["is_sample"])
+
+    def test_directory_named_creditcard_csv_is_not_treated_as_a_file(self):
+        with tempfile.TemporaryDirectory(prefix="fraudshield_source_") as temp_dir:
+            root = Path(temp_dir)
+            full = root / "creditcard.csv"
+            full.mkdir()
+            sample = root / "data" / "sample_transactions.csv"
+            sample.parent.mkdir()
+            sample.write_text(synthetic_dataset_csv())
+
+            source = app.resolve_dataset(full, sample)
+            self.assertEqual(source["kind"], "sample")
+
+
+class TestBundledSampleDataset(unittest.TestCase):
+    def test_sample_file_is_small_real_schema_and_contains_both_classes(self):
+        self.assertTrue(app.SAMPLE_DATASET_PATH.is_file())
+        data = pd.read_csv(app.SAMPLE_DATASET_PATH)
+        self.assertEqual(list(data.columns), DATASET_COLUMNS)
+        self.assertEqual(len(data), 100)
+        self.assertLess(app.SAMPLE_DATASET_PATH.stat().st_size, 200_000)
+        self.assertEqual(int((data["Class"] == 0).sum()), 80)
+        self.assertEqual(int((data["Class"] == 1).sum()), 20)
+        self.assertTrue(set(data["Class"]).issubset({0, 1}))
+        self.assertFalse(data[DATASET_COLUMNS].isna().any().any())
+
+    def test_sample_file_loads_with_expected_summary(self):
+        data, summary = app.load_dataset(str(app.SAMPLE_DATASET_PATH))
+        self.assertEqual(len(data), 100)
+        self.assertEqual(summary["rows"], 100)
+        self.assertEqual(summary["columns"], 31)
+        self.assertEqual(summary["fraud_count"], 20)
+        self.assertEqual(summary["legitimate_count"], 80)
+        self.assertEqual(summary["fraud_rate"], 0.2)
+        self.assertEqual(summary["missing_total"], 0)
+        self.assertTrue(
+            {"Time", "V1", "V28", "Amount", "Class"}.issubset(data.columns)
+        )
+
+    def test_sample_row_uses_artifact_order_and_excludes_class(self):
+        artifact = app.load_model_artifact(str(app.MODEL_PATH))
+        data = pd.read_csv(app.SAMPLE_DATASET_PATH)
+        row = data.iloc[0]
+        values = app.model_input_values(row, artifact["feature_names"])
+
+        self.assertEqual(list(values), artifact["feature_names"])
+        self.assertEqual(len(values), 30)
+        self.assertNotIn("Class", values)
+        self.assertIn("Class", row.index)
+
+    def test_real_sample_row_scores_with_the_saved_model(self):
+        artifact = app.load_model_artifact(str(app.MODEL_PATH))
+        data = pd.read_csv(app.SAMPLE_DATASET_PATH)
+        values = app.model_input_values(data.iloc[0], artifact["feature_names"])
+        probability, prediction = app.predict_transaction(
+            artifact["model"],
+            artifact["feature_names"],
+            artifact["threshold"],
+            values,
+        )
+        self.assertGreaterEqual(probability, 0.0)
+        self.assertLessEqual(probability, 1.0)
+        self.assertIn(prediction, (0, 1))
 
 
 @unittest.skipUnless(AppTest is not None, "Streamlit AppTest is unavailable")
@@ -550,8 +676,21 @@ class TestDashboardIntegration(unittest.TestCase):
         at.button(key="nav_Dataset Explorer").click().run()
         self.assertEqual(at.exception, [])
         explorer = app_text(at)
-        for expected in ("284,807", "31", "492", "1,081", "283,726"):
+        dataset_source = app.resolve_dataset()
+        self.assertNotEqual(dataset_source["kind"], "missing")
+        _, dataset_summary = app.load_dataset(str(dataset_source["path"]))
+        for expected in (
+            f"{dataset_summary['rows']:,}",
+            str(dataset_summary["columns"]),
+            f"{dataset_summary['fraud_count']:,}",
+            f"{dataset_summary['duplicate_rows']:,}",
+            f"{dataset_summary['deduplicated_rows']:,}",
+        ):
             self.assertIn(expected, explorer)
+        if dataset_source["kind"] == "sample":
+            self.assertIn("Limited preview", explorer)
+        else:
+            self.assertIn("Complete local dataset", explorer)
 
         at.button(key="nav_Risk Analysis").click().run()
         self.assertEqual(at.exception, [])
@@ -697,6 +836,101 @@ class TestDashboardIntegration(unittest.TestCase):
         finally:
             shutil.rmtree(directory, ignore_errors=True)
 
+    def test_sample_file_fallback_labels_preview_and_scores_rows(self):
+        sample_csv = app.SAMPLE_DATASET_PATH.read_text()
+        directory = make_temp_app(with_model=True, sample_dataset=sample_csv)
+        try:
+            at = AppTest.from_file(str(directory / "10_app.py"), default_timeout=120)
+            at.run()
+            self.assertEqual(at.exception, [])
+            self.assertIn("82.61%", app_text(at))
+
+            at.button(key="nav_Dataset Explorer").click().run()
+            self.assertEqual(at.exception, [])
+            explorer = app_text(at)
+            self.assertIn("Limited preview", explorer)
+            self.assertIn("data/sample_transactions.csv", explorer)
+            self.assertIn("100", explorer)
+            self.assertNotIn("Complete local dataset", explorer)
+
+            at.button(key="nav_Risk Analysis").click().run()
+            self.assertEqual(at.exception, [])
+            risk = app_text(at)
+            self.assertIn("Limited preview", risk)
+            self.assertIn("100 bundled preview rows available", risk)
+            self.assertIn("Dataset row", risk)
+            self.assertIn("Dataset label", risk)
+            self.assertIn("Model estimate", risk)
+            input_table = at.dataframe[-1].value
+            self.assertEqual(input_table.shape, (30, 3))
+            self.assertNotIn("Class", set(input_table["Feature"]))
+            self.assertEqual(
+                list(input_table["Feature"]), app.load_model_artifact(str(app.MODEL_PATH))["feature_names"]
+            )
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_full_dataset_is_preferred_over_the_bundled_sample(self):
+        full_csv = synthetic_dataset_csv(rows=4, fraud_rows=1)
+        expected_rows = 4
+        directory = make_temp_app(
+            with_model=True,
+            dataset=full_csv,
+            sample_dataset=app.SAMPLE_DATASET_PATH.read_text(),
+        )
+        try:
+            at = AppTest.from_file(str(directory / "10_app.py"), default_timeout=120)
+            at.run()
+            at.button(key="nav_Dataset Explorer").click().run()
+            self.assertEqual(at.exception, [])
+            explorer = app_text(at)
+            self.assertIn("Complete local dataset", explorer)
+            self.assertIn(f"{expected_rows}", explorer)
+            self.assertNotIn("Limited preview", explorer)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_random_fraud_uses_sample_file_when_full_dataset_is_missing(self):
+        directory = make_temp_app(
+            with_model=True,
+            sample_dataset=app.SAMPLE_DATASET_PATH.read_text(),
+        )
+        try:
+            at = AppTest.from_file(str(directory / "10_app.py"), default_timeout=120)
+            at.run()
+            at.button(key="nav_Risk Analysis").click().run()
+            for button in at.button:
+                if button.label == "Random fraud":
+                    button.click().run()
+                    break
+            self.assertEqual(at.exception, [])
+            facts = [
+                str(element.value)
+                for element in at.markdown
+                if "fs-facts" in str(element.value)
+            ]
+            truth = [
+                str(element.value)
+                for element in at.markdown
+                if "fs-truth-value" in str(element.value)
+            ]
+            self.assertTrue(any("Dataset label" in block and "Fraud" in block for block in facts))
+            self.assertTrue(any("fs-truth-value danger" in block for block in truth))
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_both_dataset_files_missing_shows_actionable_message(self):
+        directory = make_temp_app(with_model=True)
+        try:
+            at = AppTest.from_file(str(directory / "10_app.py"), default_timeout=120)
+            at.run()
+            at.button(key="nav_Dataset Explorer").click().run()
+            self.assertEqual(at.exception, [])
+            self.assertIn("creditcard.csv was not found", app_text(at))
+            self.assertIn("data/sample_transactions.csv", app_text(at))
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
     def test_corrupt_model_shows_safe_page(self):
         directory = make_temp_app(with_model=True, corrupt_model=True)
         try:
@@ -719,7 +953,9 @@ class TestRepositoryReadiness(unittest.TestCase):
             if line.strip() and not line.strip().startswith("#")
         }
         self.assertIn("creditcard.csv", lines)
-        self.assertTrue((ROOT / "creditcard.csv").exists())
+        self.assertTrue((ROOT / "data" / "sample_transactions.csv").is_file())
+        self.assertNotIn("data/sample_transactions.csv", lines)
+        self.assertNotIn("data/", lines)
         self.assertNotIn("*.py", lines)
         self.assertNotIn("*.joblib", lines)
         for required in (
@@ -753,9 +989,12 @@ class TestRepositoryReadiness(unittest.TestCase):
             "python -m streamlit run 10_app.py",
             "python -B -m unittest discover -s tests -v",
             "creditcard.csv",
+            "data/sample_transactions.csv",
+            "Bundled sample preview",
+            "100 rows",
+            "https://payshield-ml.streamlit.app/",
         ):
             self.assertIn(expected, readme)
-        self.assertIn("No public FraudShield AI deployment URL is currently confirmed", readme)
         self.assertIn("not a FraudShield AI deployment", readme)
 
 

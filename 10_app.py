@@ -31,6 +31,9 @@ except ImportError as error:  # pragma: no cover - environment guard
 PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_PATH = PROJECT_DIR / "models" / "fraudshield_random_forest.joblib"
 DATASET_PATH = PROJECT_DIR / "creditcard.csv"
+# Small committed preview used when the complete 144 MB CSV is absent (for
+# example on Streamlit Community Cloud). It is a sample, not the full dataset.
+SAMPLE_DATASET_PATH = PROJECT_DIR / "data" / "sample_transactions.csv"
 TARGET_COLUMN = "Class"
 
 NAV_ITEMS = [
@@ -230,6 +233,47 @@ def load_dataset(path_string: str) -> tuple[pd.DataFrame, dict]:
     return data, summary
 
 
+def resolve_dataset(
+    full_path: str | Path = DATASET_PATH,
+    sample_path: str | Path = SAMPLE_DATASET_PATH,
+) -> dict:
+    """Choose the dataset the dashboard should read.
+
+    The complete local ``creditcard.csv`` always wins. When it is absent, the
+    committed sample preview is used instead so deployment-specific demos still
+    work. Both paths are project-relative, not absolute machine-specific paths.
+    """
+    full = Path(full_path)
+    sample = Path(sample_path)
+
+    if full.is_file():
+        return {
+            "kind": "full",
+            "path": full,
+            "label": "creditcard.csv",
+            "title": "Complete local dataset",
+            "badge": "Full dataset",
+            "is_sample": False,
+        }
+    if sample.is_file():
+        return {
+            "kind": "sample",
+            "path": sample,
+            "label": "data/sample_transactions.csv",
+            "title": "Bundled sample preview",
+            "badge": "Sample preview",
+            "is_sample": True,
+        }
+    return {
+        "kind": "missing",
+        "path": None,
+        "label": "creditcard.csv",
+        "title": "Dataset unavailable",
+        "badge": "Unavailable",
+        "is_sample": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
@@ -249,6 +293,22 @@ def _fraud_probability_column(model) -> int:
     return class_labels.index(1)
 
 
+def model_input_values(row, feature_names: list[str]) -> dict:
+    """Select exactly the model inputs, in the artifact's saved order.
+
+    Dataset columns such as ``Class`` and any other extra fields are ignored.
+    This keeps ground truth out of inference even when the source is a full
+    dataset row.
+    """
+    missing = [name for name in feature_names if name not in row]
+    if missing:
+        raise ValueError("Missing model features: " + ", ".join(missing))
+    try:
+        return {name: float(row[name]) for name in feature_names}
+    except (TypeError, ValueError) as error:
+        raise ValueError("Every feature must be a valid numeric value.") from error
+
+
 def predict_transaction(
     model,
     feature_names: list[str],
@@ -260,11 +320,7 @@ def predict_transaction(
     A DataFrame is built with ``columns=feature_names`` so the model receives
     the same feature names and order that were saved with the artifact.
     """
-    missing = [name for name in feature_names if name not in values]
-    if missing:
-        raise ValueError("Missing model features: " + ", ".join(missing))
-
-    row = {name: values[name] for name in feature_names}
+    row = model_input_values(values, feature_names)
     frame = pd.DataFrame([row], columns=feature_names)
     frame = frame.apply(pd.to_numeric, errors="coerce").astype(float)
 
@@ -1528,7 +1584,11 @@ def render_sidebar(artifact: dict | None) -> None:
 
         model_status = "Artifact loaded" if artifact is not None else "Artifact missing"
         model_dot = "fs-dot-ok" if artifact is not None else "fs-dot-bad"
-        dataset_status = "Available" if DATASET_PATH.exists() else "Not found"
+        dataset_source = resolve_dataset()
+        dataset_status = {
+            "full": "Complete",
+            "sample": "Sample preview",
+        }.get(dataset_source["kind"], "Not found")
         threshold_text = (
             f"{artifact['threshold']:.2f}" if artifact is not None else "Unavailable"
         )
@@ -1936,8 +1996,12 @@ def render_overview(artifact: dict) -> None:
 
 
 def set_random_sample(pool: str) -> None:
-    """Callback: choose a real row from the local dataset."""
-    data, _ = load_dataset(str(DATASET_PATH))
+    """Callback: choose a real row from the active dataset."""
+    source = resolve_dataset()
+    if source["kind"] == "missing":
+        return
+
+    data, _ = load_dataset(str(source["path"]))
     if pool == "fraud":
         candidates = data[data[TARGET_COLUMN] == 1]
     elif pool == "legitimate":
@@ -1952,24 +2016,36 @@ def set_random_sample(pool: str) -> None:
 def render_sample_mode(artifact: dict) -> None:
     features = artifact["feature_names"]
     threshold = artifact["threshold"]
+    source = resolve_dataset()
 
-    if not DATASET_PATH.exists():
+    if source["kind"] == "missing":
         html_block(
             """
             <div class="fs-warning">
-                <b>creditcard.csv was not found.</b> Sample-transaction mode is unavailable.
-                Custom feature input remains usable, and the Overview and Model Performance
-                sections do not require the dataset.
+                <b>creditcard.csv was not found, and the bundled preview
+                data/sample_transactions.csv is also unavailable.</b>
+                Sample-transaction mode is unavailable. Custom feature input remains
+                usable, and the Overview and Model Performance sections do not require
+                the dataset.
             </div>
             """,
         )
         return
 
     try:
-        data, summary = load_dataset(str(DATASET_PATH))
+        data, summary = load_dataset(str(source["path"]))
     except Exception as error:  # noqa: BLE001 - surface a clear UI error
         st.error(f"The dataset could not be loaded: {error}")
         return
+
+    if source["is_sample"]:
+        render_notice(
+            "<b>Limited preview.</b> The complete <code>creditcard.csv</code> is not "
+            "available here, so sample mode uses the bundled "
+            "<code>data/sample_transactions.csv</code> file. It contains a small "
+            f"selection of {summary['rows']:,} rows, not the full dataset. Predictions "
+            "and dataset labels below describe only this preview."
+        )
 
     missing_features = [name for name in features if name not in data.columns]
     if missing_features:
@@ -1985,7 +2061,8 @@ def render_sample_mode(artifact: dict) -> None:
 
     if summary["rows"] == 0:
         st.error(
-            "creditcard.csv contains no rows. Sample-transaction mode is unavailable."
+            f"{source['label']} contains no rows. "
+            "Sample-transaction mode is unavailable."
         )
         st.info(
             "Custom feature input remains usable, and the Overview and Model "
@@ -1995,12 +2072,22 @@ def render_sample_mode(artifact: dict) -> None:
 
     if "sample_index" not in st.session_state:
         st.session_state.sample_index = 0
+    # Keep a stale index from a previously loaded file within the active range.
+    if not 0 <= int(st.session_state.sample_index) < len(data):
+        st.session_state.sample_index = 0
 
-    render_section_head(
-        "Choose a transaction",
-        f"{summary['rows']:,} local rows available. Row selection is local and never transmitted.",
-        "Sample mode",
-    )
+    if source["is_sample"]:
+        subtitle = (
+            f"{summary['rows']:,} bundled preview rows available (not the complete "
+            "dataset). Row selection is local and never transmitted."
+        )
+    else:
+        subtitle = (
+            f"{summary['rows']:,} local rows available. Row selection is local and "
+            "never transmitted."
+        )
+
+    render_section_head("Choose a transaction", subtitle, source["badge"])
 
     control_left, control_mid, control_right = st.columns([2.25, 1, 1])
     with control_left:
@@ -2010,7 +2097,7 @@ def render_sample_mode(artifact: dict) -> None:
             max_value=int(len(data) - 1),
             step=1,
             key="sample_index",
-            help="Select any row by its local dataset index. The row's Class label is not used by the model.",
+            help="Select any row by its loaded dataset index. The row's Class label is not used by the model.",
         )
     with control_mid:
         st.button(
@@ -2018,7 +2105,7 @@ def render_sample_mode(artifact: dict) -> None:
             width="stretch",
             on_click=set_random_sample,
             args=("any",),
-            help="Pick a random row from the full dataset.",
+            help="Pick a random row from the active dataset.",
         )
     with control_right:
         st.button(
@@ -2032,10 +2119,10 @@ def render_sample_mode(artifact: dict) -> None:
     try:
         row = data.loc[int(selected_index)]
     except KeyError:
-        st.error("That row index is not present in the local dataset.")
+        st.error("That row index is not present in the loaded dataset.")
         return
 
-    values = {name: float(row[name]) for name in features}
+    values = model_input_values(row, features)
     try:
         probability, prediction = predict_transaction(
             artifact["model"], features, threshold, values
@@ -2217,8 +2304,9 @@ def render_risk_analysis(artifact: dict) -> None:
     render_page_header(
         "Transaction Risk Analysis",
         "Score a single transaction",
-        "Inspect a real row from the local dataset or enter a complete 30-feature "
-        "vector. The saved threshold decides the final class.",
+        "Inspect a row from the loaded dataset (the complete CSV when present, otherwise "
+        "the bundled sample preview), or enter a complete 30-feature vector. The saved "
+        "threshold decides the final class.",
     )
 
     mode = st.radio(
@@ -2238,48 +2326,78 @@ def render_risk_analysis(artifact: dict) -> None:
 def render_dataset_explorer() -> None:
     render_page_header(
         "Dataset Explorer",
-        "Local dataset summary",
-        "A lightweight summary of creditcard.csv. The Class column is summarized here "
-        "and is never used as a model input.",
+        "Dataset currently loaded",
+        "A lightweight summary of the data available to the dashboard. The Class column "
+        "is summarized here and is never used as a model input.",
     )
 
-    if not DATASET_PATH.exists():
+    source = resolve_dataset()
+    if source["kind"] == "missing":
         st.error(
-            "creditcard.csv was not found in the project folder. The dataset explorer "
-            "is unavailable, but the Overview and Model Performance sections still work."
+            "creditcard.csv was not found in the project folder, and the bundled sample "
+            "data/sample_transactions.csv is also unavailable. The dataset explorer is "
+            "unavailable, but the Overview and Model Performance sections still work."
         )
         return
 
     try:
-        data, summary = load_dataset(str(DATASET_PATH))
+        data, summary = load_dataset(str(source["path"]))
     except Exception as error:  # noqa: BLE001 - surface a clear UI error
         st.error(f"The dataset could not be loaded: {error}")
         return
 
-    render_section_head("Dataset at a glance", "Local file, not a live feed")
+    if source["is_sample"]:
+        render_notice(
+            "<b>Limited preview, not the complete dataset.</b> The full "
+            "<code>creditcard.csv</code> is not present, so this page reads the bundled "
+            f"<code>{source['label']}</code> file ({summary['rows']:,} rows). Every count, "
+            "chart, and fraud statistic below describes only this small sample. The "
+            "sample includes both classes so fraud cases stay visible; it does not "
+            "preserve the original dataset's class balance."
+        )
+    else:
+        render_notice(
+            "<b>Complete local dataset.</b> The dashboard is reading "
+            "<code>creditcard.csv</code> from the project folder. All counts and "
+            "statistics on this page are calculated from that file."
+        )
+
+    render_section_head(
+        "Dataset at a glance",
+        f"{source['label']} · Local file, not a live feed",
+        source["badge"],
+    )
     render_kpi_row(
         [
             {
                 "label": "Rows",
                 "value": f"{summary['rows']:,}",
-                "foot": f"{summary['deduplicated_rows']:,} rows remain after removing duplicates.",
+                "foot": (
+                    "Rows in the bundled preview only."
+                    if source["is_sample"]
+                    else f"{summary['deduplicated_rows']:,} rows remain after removing duplicates."
+                ),
             },
             {
                 "label": "Columns",
                 "value": str(summary["columns"]),
-                "foot": "30 model features plus the Class target.",
+                "foot": f"{summary['columns']} loaded columns; the model expects 30 features plus Class.",
                 "tone": "blue",
             },
             {
                 "label": "Fraud rate",
                 "value": f"{summary['fraud_rate']:.2%}",
-                "foot": f"{summary['fraud_count']:,} fraudulent transactions.",
+                "foot": (
+                    f"{summary['fraud_count']:,} fraud rows in this preview (not the full-dataset rate)."
+                    if source["is_sample"]
+                    else f"{summary['fraud_count']:,} fraudulent transactions."
+                ),
                 "tone": "amber",
             },
             {
                 "label": "Duplicate rows",
                 "value": f"{summary['duplicate_rows']:,}",
-                "foot": "Exact duplicates in the raw CSV.",
+                "foot": "Exact duplicates in the loaded CSV.",
                 "tone": "teal",
             },
         ],
@@ -2294,6 +2412,18 @@ def render_dataset_explorer() -> None:
             / math.log10(max_count + 1)
             * 100.0
         )
+        if source["is_sample"]:
+            distribution_note = (
+                "Bars use a log scale so fraud rows remain visible. Counts are exact "
+                f"for this bundled preview. Fraud makes up {summary['fraud_rate']:.2%} "
+                "of these sample rows; that is not the original dataset's fraud rate."
+            )
+        else:
+            distribution_note = (
+                "Bars use a log scale so the rare fraud cases remain visible. Counts are "
+                f"exact. Fraud makes up {summary['fraud_rate']:.2%} of all rows, a severe "
+                "class imbalance."
+            )
         html_block(
             f"""
             <div class="fs-panel">
@@ -2313,9 +2443,7 @@ def render_dataset_explorer() -> None:
                     <b>{summary['fraud_count']:,}</b>
                 </div>
                 <div class="fs-muted" style="margin-top:0.75rem;">
-                    Bars use a log scale so the rare fraud cases remain visible. Counts are
-                    exact. Fraud makes up {summary['fraud_rate']:.2%} of all rows, a severe
-                    class imbalance.
+                    {esc(distribution_note)}
                 </div>
             </div>
             """,
@@ -2325,14 +2453,16 @@ def render_dataset_explorer() -> None:
         missing_text = (
             "None" if summary["missing_total"] == 0 else f"{summary['missing_total']:,}"
         )
+        non_target_columns = sum(1 for column in data.columns if column != TARGET_COLUMN)
         html_block(
             f"""
             <div class="fs-panel">
                 <div class="fs-panel-title">Data quality</div>
+                <div class="fs-check-row"><span>Loaded file</span><b>{esc(source['label'])}</b></div>
                 <div class="fs-check-row"><span>Missing values</span><b>{missing_text}</b></div>
                 <div class="fs-check-row"><span>Exact duplicate rows</span><b>{summary['duplicate_rows']:,}</b></div>
                 <div class="fs-check-row"><span>Rows after deduplication</span><b>{summary['deduplicated_rows']:,}</b></div>
-                <div class="fs-check-row"><span>Model features</span><b>30</b></div>
+                <div class="fs-check-row"><span>Columns other than Class</span><b>{non_target_columns}</b></div>
                 <div class="fs-check-row"><span>Target</span><b>Class (0 / 1)</b></div>
                 <div class="fs-check-row"><span>DataFrame memory (approx.)</span><b>{summary['memory_mb']:.1f} MB</b></div>
             </div>
@@ -2357,10 +2487,16 @@ def render_dataset_explorer() -> None:
 
     with st.expander("Preview the first rows"):
         st.dataframe(data.head(8), width="stretch")
-        st.caption(
-            "Preview only. The model input excludes the Class column and uses the "
-            "feature order stored inside the saved artifact."
-        )
+        if source["is_sample"]:
+            st.caption(
+                "Preview of the bundled sample only. The model input excludes the Class "
+                "column and uses the feature order stored inside the saved artifact."
+            )
+        else:
+            st.caption(
+                "Preview only. The model input excludes the Class column and uses the "
+                "feature order stored inside the saved artifact."
+            )
 
     if summary["missing_total"] > 0:
         st.warning(
@@ -2601,8 +2737,9 @@ def render_model_details(artifact: dict) -> None:
             <div class="fs-def-grid">
                 <div class="fs-def">
                     <span>No live data</span>
-                    <p>All analysis uses the local creditcard.csv file. There is no live
-                    transaction feed, bank connection, or external API call.</p>
+                    <p>All analysis uses the local creditcard.csv file when present, or the
+                    bundled sample preview otherwise. There is no live transaction feed,
+                    bank connection, or external API call.</p>
                 </div>
                 <div class="fs-def">
                     <span>Dataset-specific</span>
@@ -2680,7 +2817,9 @@ def render_footer() -> None:
                 <code>Time</code> and <code>Amount</code>. This project removes exact
                 duplicate rows before training, so the processed row count can differ
                 from the original dataset size. The dashboard reads the local
-                <code>creditcard.csv</code>; it does not download data from Kaggle.
+                <code>creditcard.csv</code> when it is available and otherwise falls
+                back to the small committed preview at
+                <code>data/sample_transactions.csv</code>. It does not download data from Kaggle.
             </div>
         </div>
         """,
