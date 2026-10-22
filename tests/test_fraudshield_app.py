@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 import tempfile
+import tomllib
 import unittest
 import warnings
 from pathlib import Path
@@ -747,6 +748,38 @@ class TestDashboardIntegration(unittest.TestCase):
         self.assertIn("Predicted legitimate", text)
         self.assertIn("20.00%", text)
 
+    def test_custom_mode_reset_clears_every_field(self):
+        at = AppTest.from_file(str(APP_PATH), default_timeout=180)
+        at.run()
+        at.button(key="nav_Risk Analysis").click().run()
+        at.radio[0].set_value("Custom feature input").run()
+
+        version = at.session_state.get("custom_form_version", 0)
+        for key in list(at.session_state):
+            if key.startswith(f"custom_feature_{version}_"):
+                at.session_state[key] = 1.5
+        at.run()
+        self.assertEqual(len(at.number_input), 30)
+        self.assertTrue(all(widget.value == 1.5 for widget in at.number_input))
+
+        reset = next(
+            (button for button in at.button if button.label == "Reset fields"), None
+        )
+        self.assertIsNotNone(reset, "Reset fields button was not rendered")
+        reset.click().run()
+
+        self.assertEqual(at.exception, [])
+        self.assertEqual(len(at.number_input), 30)
+        self.assertTrue(
+            all(widget.value is None for widget in at.number_input),
+            "Reset fields must clear all 30 inputs",
+        )
+        self.assertEqual(at.session_state["custom_form_version"], version + 1)
+        self.assertFalse(
+            any(key.startswith(f"custom_feature_{version}_") for key in at.session_state),
+            "Stale widget keys from the previous form version should be removed",
+        )
+
     def test_footer_dataset_source_is_complete_and_links_to_kaggle(self):
         at = AppTest.from_file(str(APP_PATH), default_timeout=180)
         at.run()
@@ -941,6 +974,75 @@ class TestDashboardIntegration(unittest.TestCase):
             self.assertIn("Technical detail", [expander.label for expander in at.expander])
         finally:
             shutil.rmtree(directory, ignore_errors=True)
+
+
+def _relative_luminance(rgb):
+    channels = []
+    for value in rgb:
+        channel = value / 255
+        channels.append(
+            channel / 12.92 if channel <= 0.03928 else ((channel + 0.055) / 1.055) ** 2.4
+        )
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast_ratio(foreground, background):
+    lighter = max(_relative_luminance(foreground), _relative_luminance(background))
+    darker = min(_relative_luminance(foreground), _relative_luminance(background))
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _hex_rgb(value):
+    text = value.lstrip("#")
+    if len(text) != 6:
+        raise ValueError(f"Expected a 6-digit hex color, got {value!r}")
+    return tuple(int(text[index : index + 2], 16) for index in (0, 2, 4))
+
+
+class TestThemeConfiguration(unittest.TestCase):
+    def load_theme_config(self):
+        config_path = ROOT / ".streamlit" / "config.toml"
+        self.assertTrue(
+            config_path.is_file(),
+            "The deployed theme lives in .streamlit/config.toml and must be tracked",
+        )
+        with config_path.open("rb") as handle:
+            return config_path, tomllib.load(handle)
+
+    def test_theme_config_is_present_dark_and_not_ignored(self):
+        _, config = self.load_theme_config()
+        theme = config["theme"]
+        self.assertEqual(theme["base"], "dark")
+        self.assertFalse(config["browser"]["gatherUsageStats"])
+        ignored = {
+            line.strip().rstrip("/")
+            for line in (ROOT / ".gitignore").read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        self.assertNotIn(".streamlit", ignored)
+        self.assertNotIn(".streamlit/config.toml", ignored)
+
+    def test_primary_and_secondary_button_contrast_meets_wcag_aa(self):
+        _, config = self.load_theme_config()
+        theme = config["theme"]
+        # Streamlit renders primary buttons with white text.
+        primary_text_contrast = _contrast_ratio(
+            (255, 255, 255), _hex_rgb(theme["primaryColor"])
+        )
+        self.assertGreaterEqual(
+            primary_text_contrast,
+            4.5,
+            f"Primary button white text on {theme['primaryColor']} is "
+            f"{primary_text_contrast:.2f}:1, below WCAG AA 4.5:1",
+        )
+        secondary_text_contrast = _contrast_ratio(
+            _hex_rgb(theme["textColor"]), _hex_rgb(theme["secondaryBackgroundColor"])
+        )
+        self.assertGreaterEqual(
+            secondary_text_contrast,
+            4.5,
+            f"Secondary button text contrast is {secondary_text_contrast:.2f}:1",
+        )
 
 
 class TestRepositoryReadiness(unittest.TestCase):

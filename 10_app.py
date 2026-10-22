@@ -2167,7 +2167,16 @@ def render_sample_mode(artifact: dict) -> None:
 
 
 def clear_custom_state() -> None:
-    """Callback: clear the advanced form before widgets are re-instantiated."""
+    """Callback: clear the advanced form before widgets are re-instantiated.
+
+    Widget values inside an ``st.form`` are retained by the form, so deleting
+    their session-state keys alone does not visually reset them. Bumping a
+    version used in the form and widget keys forces Streamlit to create fresh
+    widgets with their default (empty) values on the next rerun.
+    """
+    st.session_state.custom_form_version = (
+        int(st.session_state.get("custom_form_version", 0)) + 1
+    )
     for key in list(st.session_state.keys()):
         if key.startswith("custom_feature_"):
             del st.session_state[key]
@@ -2179,6 +2188,7 @@ def clear_custom_state() -> None:
 def render_custom_mode(artifact: dict) -> None:
     features = artifact["feature_names"]
     threshold = artifact["threshold"]
+    form_version = int(st.session_state.get("custom_form_version", 0))
 
     html_block(
         """
@@ -2200,7 +2210,7 @@ def render_custom_mode(artifact: dict) -> None:
         )
 
     values: dict[str, float | None] = {}
-    with st.form("custom_feature_form"):
+    with st.form(f"custom_feature_form_{form_version}"):
         st.markdown("#### Feature vector")
         st.caption(
             "Enter every value in the model's feature list. Empty fields are rejected."
@@ -2218,7 +2228,7 @@ def render_custom_mode(artifact: dict) -> None:
                     value=None,
                     step=0.1,
                     format="%.4f",
-                    key=f"custom_feature_{name}",
+                    key=f"custom_feature_{form_version}_{name}",
                     help="PCA component. Enter the transformed numeric value." if name.startswith("V") else None,
                 )
 
